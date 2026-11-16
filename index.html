@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#06261d">
+<title>Blackjack entre potes</title>
+<meta name="description" content="Blackjack en ligne entre amis, jetons fictifs. Crée une table, envoie le lien, jouez.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23b8202a'/%3E%3Ccircle cx='32' cy='32' r='20' fill='none' stroke='%23fff' stroke-width='5' stroke-dasharray='8 6'/%3E%3Ctext x='32' y='40' font-size='22' text-anchor='middle' fill='%23fff' font-family='Arial' font-weight='bold'%3E21%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Accueil -->
+<section id="home" class="screen" hidden>
+  <div class="panel">
+    <div class="logo" aria-hidden="true"><span class="lc">A<i>♠</i></span><span class="lc r">R<i>♥</i></span></div>
+    <h1>Blackjack entre potes</h1>
+    <p class="sub">Jetons fictifs uniquement. Crée une table, envoie le lien, jouez chacun sur votre téléphone.</p>
+    <button id="create" class="big">Créer une table</button>
+    <form id="joinForm" class="row">
+      <input id="joinCode" maxlength="6" autocomplete="off" autocapitalize="characters" placeholder="Code de table" aria-label="Code de table">
+      <button class="sec" type="submit">Rejoindre</button>
+    </form>
+    <p class="fine">Aucun compte. Jusqu'à 6 joueurs par table.</p>
+  </div>
+</section>
+
+<!-- Choix du pseudo -->
+<section id="lobby" class="screen" hidden>
+  <form class="panel" id="lobbyForm">
+    <p class="kicker">Table <b id="lobbyCode"></b></p>
+    <h1>Choisis ton pseudo</h1>
+    <input id="nick" maxlength="14" autocomplete="nickname" placeholder="Ton pseudo" aria-label="Ton pseudo" required>
+    <p class="bank" id="bankInfo"></p>
+    <p class="err" id="lobbyErr" role="alert"></p>
+    <button class="big" type="submit">M'asseoir à la table</button>
+    <button class="link" type="button" id="backHome">Créer ou rejoindre une autre table</button>
+  </form>
+</section>
+
+<!-- Partie -->
+<section id="game" hidden>
+  <header class="top">
+    <div class="tcode"><span>Table</span> <b id="gCode"></b></div>
+    <button id="invite" class="sec small">Inviter</button>
+    <div class="net"><span class="dot" id="dot"></span><span id="netTxt">…</span></div>
+    <div class="mychips" id="myChips"></div>
+    <button id="quit" class="ghost small" aria-label="Quitter la table">✕</button>
+  </header>
+  <main class="stage">
+    <div class="table" id="table">
+      <div class="felt"></div>
+      <div class="rack" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="shoe" aria-hidden="true"></div>
+      <svg class="arc" viewBox="0 0 400 110" aria-hidden="true"><path id="arcp" d="M 15 18 Q 200 125 385 18" fill="none"/><text><textPath href="#arcp" startOffset="50%" text-anchor="middle">LE BLACKJACK PAIE 3 POUR 2</textPath></text></svg>
+      <div class="dealer" id="dealer"><div class="hand" id="dHand"></div><span class="tot" id="dTot" hidden></span></div>
+      <div class="msg" id="msg" aria-live="polite"></div>
+      <div id="seats"></div>
+    </div>
+  </main>
+  <footer class="bar" id="bar"></footer>
+  <div class="toast" id="toast" role="status" hidden></div>
+</section>
+
+<script src="peerjs.min.js"></script>
+<script src="engine.js"></script>
+<script src="host.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
