@@ -3,7 +3,7 @@ import json, sys, time
 from playwright.sync_api import sync_playwright
 
 BASE = "http://localhost:8080/"
-PS = "127.0.0.1:9000"
+MQ = "ws://127.0.0.1:8883,ws://127.0.0.1:8884"
 CODE = sys.argv[1] if len(sys.argv) > 1 else "TEST1"
 SHOTS = "/home/claude/bj/test/shots/"
 PHONE = dict(viewport={"width": 390, "height": 844}, device_scale_factor=2, is_mobile=True, has_touch=True)
@@ -37,7 +37,7 @@ def open_player(br, ctxopts, nick, code=CODE):
     ctx = br.new_context(**ctxopts)
     p = ctx.new_page()
     p.on("pageerror", lambda e: results.append("ERREUR JS " + nick + ": " + str(e)))
-    p.goto(f"{BASE}?t={code}&ps={PS}", wait_until="domcontentloaded")
+    p.goto(f"{BASE}?t={code}&mq={MQ}", wait_until="domcontentloaded")
     p.fill("#nick", nick)
     p.click("#lobbyForm button[type=submit]")
     return ctx, p
@@ -147,6 +147,16 @@ def main():
         ok(True, "une manche complète se joue avec le nouvel hôte")
         newhost.screenshot(path=SHOTS + "06_apres_reprise.png")
 
+        print("5b. Un des deux serveurs de messagerie tombe")
+        import subprocess
+        subprocess.run(["pkill", "-f", "brokers.js 8883"])
+        time.sleep(1)
+        wait(lambda: V(newhost)["ph"] == "bet", timeout=12)
+        play_round(rest, newhost)
+        ok(len({strip(V(p)) for p in rest}) == 1, "avec un serveur en panne, la partie continue normalement")
+        subprocess.Popen(["node", "brokers.js", "8883"], cwd="/home/claude/bj/test", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+
         print("6. Retour un autre jour : le solde est retrouvé")
         wait(lambda: V(newhost)["ph"] == "bet", timeout=12)
         cid_c = C.evaluate("__bj.cid")
@@ -154,7 +164,7 @@ def main():
         bank = C.evaluate("JSON.parse(localStorage.getItem('bj-bank'))")
         ok(bank["léa"]["chips"] == lea["chips"], f"solde de Léa sauvegardé dans son navigateur : {bank['léa']['chips']}")
         C.close()
-        C2 = cC.new_page(); C2.goto(f"{BASE}?t=AUTRE&ps={PS}", wait_until="domcontentloaded")
+        C2 = cC.new_page(); C2.goto(f"{BASE}?t=AUTRE&mq={MQ}", wait_until="domcontentloaded")
         C2.fill("#nick", "Léa"); C2.dispatch_event("#nick", "input")
         ok(str(lea["chips"]) in C2.inner_text("#bankInfo").replace(" ", "").replace(" ", ""), "à la réouverture : « " + C2.inner_text("#bankInfo") + " »")
         C2.click("#lobbyForm button[type=submit]")

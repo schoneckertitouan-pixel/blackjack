@@ -1,4 +1,4 @@
-/* Interface + réseau (PeerJS). Le premier arrivé sur un code tient la table (hôte) ;
+/* Interface + réseau (serveurs MQTT publics). Le premier arrivé sur un code tient la table (hôte) ;
    les autres se connectent directement à lui. Si l'hôte part, un joueur reprend la table avec le même code. */
 (function () {
   'use strict';
@@ -6,7 +6,7 @@
   const store = (S) => ({ get(k, d) { try { const v = S.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } }, set(k, v) { try { S.setItem(k, JSON.stringify(v)); } catch (e) { } } });
   const LS = store(window.localStorage), SS = store(window.sessionStorage);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const PREFIX = 'bjpotes-v1-';
+  const TOPIC = 'bjpotes-tit/v2/';
   const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const fmt = n => Number(n).toLocaleString('fr-FR');
   const params = new URLSearchParams(location.search);
@@ -17,12 +17,6 @@
 
   function clean(c) { return String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6); }
   function genCode() { const a = new Uint32Array(5); crypto.getRandomValues(a); return Array.from(a, x => ALPHA[x % ALPHA.length]).join(''); }
-  function peerOpts() {
-    const o = { debug: 0, config: undefined };
-    const ps = params.get('ps'); // serveur de connexion de test (ex. localhost:9000) — normalement absent
-    if (ps) { const [h, p] = ps.split(':'); Object.assign(o, { host: h, port: +p || 9000, path: '/', secure: false }); }
-    delete o.config; return o;
-  }
   // ---------- Solde sauvegardé (par pseudo, dans ce navigateur) ----------
   const bankKey = n => String(n).trim().toLowerCase();
   function bankGet(n) { return (LS.get('bj-bank', {}))[bankKey(n)] || null; }
@@ -47,7 +41,7 @@
     e.preventDefault(); const n = BJ.cleanNick($('#nick').value); if (!n) return;
     myNick = n; LS.set('bj-pseudo', n); startGame();
   };
-  $('#quit').onclick = () => { if (confirm('Quitter la table ? Tes jetons restent sauvegardés.')) { if (mode === 'guest') send({ type: 'act', a: 'leave' }); setTimeout(goHome, 120); } };
+  $('#quit').onclick = () => { if (confirm('Quitter la table ? Tes jetons restent sauvegardés.')) { leaveTable(); setTimeout(goHome, 300); } };
   $('#invite').onclick = async () => {
     const url = location.origin + location.pathname + '?t=' + code;
     const text = `Viens jouer au blackjack avec moi (jetons fictifs) ! Table ${code}`;
@@ -56,131 +50,200 @@
   };
 
   // ---------- Réseau ----------
+  // Tout passe par des serveurs de messagerie publics (MQTT sur WebSocket sécurisé), sans compte.
+  // On se connecte à plusieurs serveurs à la fois et on envoie chaque message sur tous : si l'un tombe, les autres suffisent.
+  const BROKERS = params.get('mq')
+    ? params.get('mq').split(',').map(u => ({ url: u }))
+    : [{ url: 'wss://broker.hivemq.com:8884/mqtt' }, { url: 'wss://public.cloud.shiftr.io', username: 'public', password: 'public' }, { url: 'wss://test.mosquitto.org:8081/mqtt' }];
+  const T = k => TOPIC + code + '/' + k;
+  const rid = () => Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+
+  function Bus(will) {
+    const seenIds = new Set(), order = [], handlers = {};
+    const clients = BROKERS.map(b => {
+      const c = mqtt.connect(b.url, { username: b.username, password: b.password, clientId: 'bj_' + rid(), clean: true, keepalive: 15, reconnectPeriod: 2500, connectTimeout: 8000, resubscribe: true, will: { topic: will.topic, payload: JSON.stringify(Object.assign({ _id: rid() }, will.msg)), qos: 0, retain: false } });
+      c.on('message', (topic, buf, packet) => {
+        const h = handlers[topic]; if (!h) return;
+        if (!buf || !buf.length) return h(null, packet.retain);
+        let m; try { m = JSON.parse(buf.toString()); } catch (e) { return; }
+        if (!m || typeof m !== 'object') return;
+        if (m._id) { if (seenIds.has(m._id)) return; seenIds.add(m._id); order.push(m._id); if (order.length > 3000) seenIds.delete(order.shift()); }
+        h(m, packet.retain);
+      });
+      c.on('error', () => { });
+      return c;
+    });
+    return {
+      sub(topic, fn) { handlers[topic] = fn; clients.forEach(c => c.subscribe(topic, { qos: 0 })); },
+      pub(topic, m, retain) { const p = JSON.stringify(Object.assign({}, m, { _id: rid() })); clients.forEach(c => { if (c.connected) c.publish(topic, p, { qos: 0, retain: !!retain }); }); },
+      clear(topic) { clients.forEach(c => { if (c.connected) c.publish(topic, '', { qos: 0, retain: true }); }); },
+      count() { return clients.filter(c => c.connected).length; },
+      end() { clients.forEach(c => { try { c.end(true); } catch (e) { } }); }
+    };
+  }
+
   let mode = 'off'; // off | connecting | host | guest
-  let peer = null, conn = null, host = null, V = null, gen = 0;
-  const conns = new Map(); let connSeq = 0; const seen = new Map();
-  let ivals = [], lastMsg = 0, failures = 0, refused = '', wake = null;
+  let bus = null, host = null, V = null, gen = 0;
+  let ivals = [], timers = [], lastMsg = 0, refused = '', wake = null, lastSeq = 0, lastHostCid = null, lastJoin = 0;
+  let claims = new Map(), mySince = 0, dead = null; const seenAt = new Map();
+  const FRESH = 15000;
 
   function setNet(txt, st) { $('#netTxt').textContent = txt; $('#dot').className = 'dot' + (st ? ' ' + st : ''); }
-  function cleanup() {
-    gen++; ivals.forEach(clearInterval); ivals = [];
-    if (host && host.timer) clearTimeout(host.timer); host = null;
-    for (const c of conns.values()) try { c.close(); } catch (e) { }
-    conns.clear(); seen.clear();
-    try { conn && conn.close(); } catch (e) { } conn = null;
-    try { peer && peer.destroy(); } catch (e) { } peer = null;
+  function later(f, ms) { const g = gen; timers.push(setTimeout(() => { if (g === gen) f(); }, ms)); }
+  function cleanup(keepBus) {
+    gen++; ivals.forEach(clearInterval); ivals = []; timers.forEach(clearTimeout); timers = [];
+    if (host && host.timer) clearTimeout(host.timer); host = null; seenAt.clear();
+    if (!keepBus && bus) { bus.end(); bus = null; claims = new Map(); }
     mode = 'off';
   }
   function startGame() {
-    show('game'); $('#gCode').textContent = code; V = null; refused = ''; failures = 0; render(); connect();
+    show('game'); $('#gCode').textContent = code; V = null; refused = ''; lastSeq = 0; lastHostCid = null; dead = null; render(); connect();
+  }
+  function freshClaims() {
+    const now = Date.now(), out = [];
+    for (const [cid, c] of claims) {
+      if (now - c.at > FRESH) continue;
+      if (dead && cid === dead.cid && c.at <= dead.at) continue;
+      out.push(Object.assign({ cid }, c));
+    }
+    return out.sort((a, b) => a.start - b.start || (a.cid < b.cid ? -1 : 1));
   }
   function connect() {
-    cleanup(); mode = 'connecting'; const g = gen;
-    setNet('Connexion à la table…');
-    tryGuest(g).then(ok => {
-      if (g !== gen || ok) return;
-      return tryHost(g).then(r => {
-        if (g !== gen || r === 'ok') return;
-        failures++;
-        if (r === 'network' || r === 'server-error' || r === 'socket-error' || r === 'timeout') setNet(failures > 2 ? 'Serveur de connexion injoignable, nouvel essai…' : 'Connexion…', 'off');
-        else setNet('La table se libère, nouvel essai…');
-        setTimeout(() => { if (g === gen) connect(); }, Math.min(1200 + failures * 800, 6000) + Math.random() * 1200);
-      });
-    });
+    const reuse = !!bus;
+    cleanup(true); mode = 'connecting';
+    setNet('Connexion à la table…'); render();
+    if (!reuse) {
+      bus = Bus({ topic: T('up'), msg: { type: 'bye', cid: myCid } });
+      bus.sub(T('host'), onHostMsg);
+      bus.sub(T('down'), onDown);
+      bus.sub(T('up'), onUp);
+    }
+    const t0 = Date.now(); let tries = 0;
+    const g = gen;
+    const wait = () => {
+      if (g !== gen) return;
+      if (!bus.count()) { if (++tries === 40) setNet('Serveurs injoignables, nouvel essai…', 'off'); return later(wait, 250); }
+      // laisser arriver le message « hôte » mémorisé par les serveurs
+      later(decide, Math.max(0, 900 - (Date.now() - t0)) + 600);
+    };
+    wait();
   }
-  // 1) Quelqu'un tient déjà la table ? On s'y connecte.
-  function tryGuest(g) {
-    return new Promise(res => {
-      const p = new Peer(undefined, peerOpts()); peer = p; let done = false;
-      const fin = v => { if (done) return; done = true; clearTimeout(to); if (!v) { try { p.destroy(); } catch (e) { } } res(v); };
-      const to = setTimeout(() => fin(false), 9000);
-      p.on('open', () => {
-        const c = p.connect(PREFIX + code.toLowerCase(), { reliable: true, serialization: 'json' });
-        c.on('open', () => { if (g !== gen) { c.close(); return fin(false); } fin(true); becomeGuest(c, p); });
-        c.on('error', () => fin(false));
-      });
-      p.on('error', e => { if (!done) fin(false); else if (mode === 'guest' && conn && !conn.open) hostLost(); });
-      p.on('disconnected', () => { if (done && mode === 'guest' && !p.destroyed) setTimeout(() => { try { p.reconnect(); } catch (e) { } }, 1500); });
-    });
+  function decide() {
+    const others = freshClaims().filter(c => c.cid !== myCid);
+    if (others.length) becomeGuest(); else claim();
   }
-  // 2) Personne : on devient l'hôte avec ce code.
-  function tryHost(g) {
-    return new Promise(res => {
-      const p = new Peer(PREFIX + code.toLowerCase(), peerOpts()); let done = false;
-      const to = setTimeout(() => { if (!done) { done = true; try { p.destroy(); } catch (e) { } res('timeout'); } }, 9000);
-      p.on('open', () => { if (done) return; done = true; clearTimeout(to); if (g !== gen) { p.destroy(); return res('stale'); } peer = p; becomeHost(p); res('ok'); });
-      p.on('error', e => {
-        if (!done) { done = true; clearTimeout(to); try { p.destroy(); } catch (x) { } return res(e.type || 'error'); }
-        if (e.type === 'unavailable-id' && mode === 'host') { toast('Un autre joueur a repris la table.'); connect(); }
-      });
-      p.on('disconnected', () => { if (done && mode === 'host' && !p.destroyed) setTimeout(() => { try { p.reconnect(); } catch (e) { } }, 1000); });
-    });
+  function claim() {
+    mode = 'connecting'; mySince = Date.now();
+    claims.set(myCid, { start: mySince, at: Date.now() });
+    bus.pub(T('host'), { cid: myCid, up: 0, t: Date.now() }, true);
+    later(() => {
+      const best = freshClaims()[0];
+      if (!best || best.cid === myCid) becomeHost(); else becomeGuest();
+    }, 1500);
   }
-  function becomeHost(p) {
-    mode = 'host'; failures = 0;
+  // Les horloges des téléphones peuvent différer : on raisonne en temps local de réception + durée depuis laquelle l'hôte tient la table.
+  function onHostMsg(m, retained) {
+    if (!m) { if (mode === 'guest' && lastHostCid) hostLost(); return; }
+    if (typeof m.cid !== 'string' || m.cid === myCid) return;
+    const now = Date.now(), at = retained ? Math.min(now, +m.t || 0) : now;
+    claims.set(m.cid, { at, start: at - Math.max(0, +m.up || 0) });
+    if (mode === 'host') {
+      const c = claims.get(m.cid);
+      if (now - c.at < FRESH && (c.start < mySince || (c.start === mySince && m.cid < myCid))) { toast('Un autre joueur tenait déjà la table : tu la rejoins.'); const keep = V; cleanup(true); V = keep; becomeGuest(); }
+    }
+  }
+  function becomeHost() {
+    mode = 'host';
     const prev = V && V.seats && V.seats.length && V.hostCid !== myCid ? V : null; // état laissé par l'hôte précédent
     host = new HostTable({
       myCid, ledger: LS.get('bj-ledger', {}), saveLedger: l => LS.set('bj-ledger', l), fromView: prev,
-      send: (id, m) => { const c = conns.get(id); if (c && c.open) try { c.send(m); } catch (e) { } },
+      send: (cid, m) => bus && bus.pub(T('down'), Object.assign({ to: cid }, m)),
+      broadcast: m => bus && bus.pub(T('down'), m),
       onState: v => onView(v)
     });
     if (prev) toast("L'hôte est parti : tu tiens la table. La manche en cours est annulée, personne ne perd sa mise.");
-    if (!BJ.find(host.G, myCid)) { const b = bankGet(myNick); const r = host.sitLocal(myNick, b ? b.chips : 1000, b ? b.t : 0); if (r && r.err) onRefused(r.err); }
+    if (!BJ.find(host.G, myCid)) { const b = bankGet(myNick); const r = host.sitLocal(myNick, b ? b.chips : 1000, b ? b.t : 0); if (r && r.err) return onRefused(r.err); }
     else host.update();
-    p.on('connection', c => {
-      const id = ++connSeq; conns.set(id, c); seen.set(id, Date.now());
-      c.on('data', m => { seen.set(id, Date.now()); if (!host || !m || typeof m !== 'object') return; if (m.type === 'join') host.join(id, m); else if (m.type === 'act') host.act(id, m); });
-      c.on('close', () => { if (conns.get(id) === c) { conns.delete(id); seen.delete(id); host && host.drop(id); render(); } });
-      c.on('error', () => { });
-    });
+    const beat = () => { if (!host || !bus) return; bus.pub(T('host'), { cid: myCid, up: Date.now() - mySince, t: Date.now() }, true); };
+    beat();
     ivals.push(setInterval(() => {
-      if (!host) return; host.ping();
+      if (!host) return; beat(); host.broadcast();
       const now = Date.now();
-      for (const [id, t] of seen) if (now - t > 20000) { const c = conns.get(id); conns.delete(id); seen.delete(id); try { c && c.close(); } catch (e) { } host.drop(id); }
-      render();
-    }, 4000));
+      for (const [cid, t] of seenAt) if (now - t > 16000) { seenAt.delete(cid); host.drop(cid); }
+    }, 3000));
     keepAwake();
   }
-  function becomeGuest(c, p) {
-    mode = 'guest'; conn = c; failures = 0; lastMsg = Date.now();
-    const b = bankGet(myNick);
-    c.on('data', m => {
-      lastMsg = Date.now(); if (!m || typeof m !== 'object') return;
-      if (m.type === 'state') onView(m.st);
-      else if (m.type === 'refused') onRefused(m.reason);
-    });
-    c.on('close', () => { if (conn === c) hostLost(); });
-    c.send(refused === 'full' ? { type: 'join', cid: myCid, watch: true } : { type: 'join', cid: myCid, nick: myNick, chips: b ? b.chips : 1000, t: b ? b.t : 0 });
+  function onUp(m) {
+    if (mode !== 'host' || !host || typeof m.cid !== 'string' || m.cid === myCid) return;
+    if (m.type === 'bye') { seenAt.delete(m.cid); host.drop(m.cid); return; }
+    seenAt.set(m.cid, Date.now());
+    if (m.type === 'join') host.join(m.cid, m);
+    else if (m.type === 'act') { if (!host.conns.has(m.cid)) return sendJoinHint(m.cid); host.act(m.cid, m); }
+    else if (m.type === 'ping' && !host.conns.has(m.cid)) sendJoinHint(m.cid);
+  }
+  function sendJoinHint(cid) { bus.pub(T('down'), { type: 'rejoin', to: cid }); }
+  function sendJoin() {
+    lastJoin = Date.now(); const b = bankGet(myNick);
+    bus.pub(T('up'), refused === 'full' ? { type: 'join', cid: myCid, watch: true } : { type: 'join', cid: myCid, nick: myNick, chips: b ? b.chips : 1000, t: b ? b.t : 0 });
+  }
+  function becomeGuest() {
+    mode = 'guest'; lastMsg = Date.now(); sendJoin();
+    setNet('Connexion à la table…');
     ivals.push(setInterval(() => {
-      if (conn !== c) return;
-      try { c.send({ type: 'ping' }); } catch (e) { }
-      if (Date.now() - lastMsg > 13000) hostLost();
-    }, 4000));
-    setNet('Connecté', 'on'); render();
+      if (mode !== 'guest' || !bus) return;
+      bus.pub(T('up'), { type: 'ping', cid: myCid });
+      if (Date.now() - lastMsg > 11000) hostLost();
+      else if ((!V || !V.seats.some(s => s.cid === myCid)) && refused !== 'full' && Date.now() - lastJoin > 2500) sendJoin();
+    }, 3000));
+    render();
+  }
+  function onDown(m) {
+    if (mode !== 'guest') return;
+    if (m.to && m.to !== myCid) return;
+    lastMsg = Date.now();
+    if (m.type === 'state' && m.st && Array.isArray(m.st.seats)) {
+      const st = m.st;
+      if (st.hostCid === lastHostCid && st.seq <= lastSeq) return; // ancien message arrivé en retard
+      if (st.hostCid !== lastHostCid) { lastHostCid = st.hostCid; }
+      lastSeq = st.seq;
+      const me = st.seats.find(s => s.cid === myCid);
+      if ((!me || me.gone) && refused !== 'full' && Date.now() - lastJoin > 2500) sendJoin();
+      setNet('Connecté' + (bus.count() < BROKERS.length ? ` (${bus.count()}/${BROKERS.length} serveurs)` : ''), 'on');
+      onView(st);
+    } else if (m.type === 'refused') onRefused(m.reason);
+    else if (m.type === 'rejoin' && Date.now() - lastJoin > 1000) sendJoin();
   }
   function onRefused(r) {
     refused = r;
-    if (r === 'nick') { cleanup(); goLobby('Ce pseudo est déjà pris à cette table. Choisis-en un autre.'); }
-    else if (r === 'full') toast('Table pleine (6 joueurs) : tu regardes la partie.');
+    if (r === 'nick') { cleanup(); goLobby('Ce pseudo est déjà pris à cette table. Choisis-en un autre.'); return; }
+    if (r === 'full') toast('Table pleine (6 joueurs) : tu regardes la partie.');
     render();
   }
   function hostLost() {
     if (mode !== 'guest') return;
-    const last = V; cleanup(); V = last; mode = 'connecting'; const g = gen;
+    const last = V, deadCid = (last && last.hostCid) || lastHostCid;
+    if (deadCid) { const c = claims.get(deadCid); dead = { cid: deadCid, at: c ? c.at : Date.now() }; }
+    cleanup(true); V = last; mode = 'connecting'; lastHostCid = null; lastSeq = 0;
     // Ordre de reprise : le joueur assis le plus tôt essaie en premier, pour éviter les doublons
-    const others = (last && last.seats || []).filter(s => s.cid !== last.hostCid && !s.gone).map(s => s.cid);
+    const others = (last && last.seats || []).filter(s => s.cid !== (last && last.hostCid) && !s.gone).map(s => s.cid);
     const rank = others.indexOf(myCid);
-    const wait = rank >= 0 ? rank * 2500 : 16000 + Math.random() * 3000;
+    const wait = rank >= 0 ? rank * 2500 : 12000 + Math.random() * 3000;
     setNet("L'hôte est parti. Reprise de la table…", 'off'); render();
-    setTimeout(() => { if (g === gen) connect(); }, 400 + wait);
+    later(() => { mode = 'connecting'; decide(); }, 300 + wait);
   }
-  function send(m) { if (conn && conn.open) try { conn.send(m); } catch (e) { } }
-  function act(a, v) { if (mode === 'host' && host) host.local(a, v); else if (mode === 'guest') send({ type: 'act', a, v }); }
+  function act(a, v) { if (mode === 'host' && host) host.local(a, v); else if (mode === 'guest' && bus) bus.pub(T('up'), { type: 'act', cid: myCid, a, v }); }
+  function leaveTable() {
+    if (bus) {
+      if (mode === 'host') bus.clear(T('host'));
+      else if (mode === 'guest') bus.pub(T('up'), { type: 'act', cid: myCid, a: 'leave' });
+    }
+  }
+  window.addEventListener('pagehide', () => { leaveTable(); });
   async function keepAwake() { try { if ('wakeLock' in navigator && document.visibilityState === 'visible' && !wake) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => { wake = null; }); } } catch (e) { } }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
     if (mode === 'host') { keepAwake(); host && host.update(); }
-    if (mode === 'guest' && Date.now() - lastMsg > 13000) hostLost();
+    if (mode === 'guest' && Date.now() - lastMsg > 11000) hostLost();
   });
 
   // ---------- État reçu ----------
@@ -194,7 +257,8 @@
     const turnCid = v.ph === 'play' && v.seats[v.turn] ? v.seats[v.turn].cid : null;
     if (turnCid === myCid && prevTurnCid !== myCid && navigator.vibrate) try { navigator.vibrate(120); } catch (e) { }
     prevTurnCid = turnCid;
-    if (mode === 'host') setNet(`Hôte · ${conns.size} connecté${conns.size > 1 ? 's' : ''}`, 'on');
+    if (mode === 'host') { const n = host ? host.conns.size : 0; setNet(`Hôte · ${n} connecté${n > 1 ? 's' : ''}`, bus && bus.count() ? 'on' : 'off'); }
+    if (me && optBet != null && me.bet === optBet) optBet = null;
     render();
   }
 

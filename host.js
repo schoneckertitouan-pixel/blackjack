@@ -89,8 +89,9 @@
     _dealer() { BJ.dealerStep(this.G); this.update(); }
     view() { const v = BJ.view(this.G); v.hostCid = this.myCid; v.t = this.now(); v.nextAt = this.G.ph === 'end' ? this.nextAt : 0; v.nextIn = this.G.ph === 'end' ? Math.max(0, this.nextAt - this.now()) : 0; return v; }
     broadcast() {
-      const v = this.view();
-      for (const id of this.conns.keys()) this.o.send(id, { type: 'state', st: v });
+      const v = this.view(); v.seq = this.seq = (this.seq || 0) + 1;
+      if (this.o.broadcast) this.o.broadcast({ type: 'state', st: v });
+      else for (const id of this.conns.keys()) this.o.send(id, { type: 'state', st: v });
       if (this.o.onState) this.o.onState(v);
     }
     ping() { for (const id of this.conns.keys()) this.o.send(id, { type: 'ping' }); }
